@@ -55,6 +55,7 @@ make install
     "enabled": true,
     "baseUrl": "http://localhost:8065",
     "botToken": "any-token",
+    "allowPrivateNetwork": true,
     "allowFrom": ["vk-user-123456789"],
     "dmPolicy": "open"
   }
@@ -62,6 +63,10 @@ make install
 ```
 
 `allowFrom` — те же ID что в `allowed_users`, но с префиксом `vk-user-`.
+
+`allowPrivateNetwork: true` нужен для новых версий OpenClaw, если мост работает на `localhost`, `127.0.0.1` или другом private/internal адресе. Без этого OpenClaw может блокировать подключение к Mattermost-мосту по SSRF-политике.
+
+Если в логах OpenClaw видно что-то вроде `SsrFBlockedError` или `Blocked hostname or private/internal/special-use IP address`, проверь, что `allowPrivateNetwork` включён именно в `channels.mattermost`.
 
 ## Управление
 
