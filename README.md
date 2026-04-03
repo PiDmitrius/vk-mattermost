@@ -4,6 +4,8 @@
 
 OpenClaw подключается к мосту как к обычному Mattermost-каналу. Мост пересылает сообщения в VK и/или MAX и обратно через Long Poll.
 
+**Вся фильтрация пользователей — на уровне моста.** OpenClaw получает статическую конфигурацию и доверяет всему, что прошло через мост.
+
 ## Требования
 
 - Go 1.22+
@@ -22,15 +24,15 @@ make install
 ## Быстрый старт
 
 1. Создать `~/.config/vk-mattermost/config.json` с токенами (списки пользователей пока пустые)
-2. `make install` -- собрать и запустить
-3. Написать боту `/i` -- получить свой ID
+2. `make install` — собрать и запустить
+3. Написать боту `/i` — получить свой ID
 4. Добавить полученный ID в конфиг моста, `systemctl --user restart vk-mattermost`
 5. Добавить канал mattermost в `openclaw.json` (см. ниже)
 6. Перезапустить OpenClaw
 
-## Конфигурация
+## Конфигурация моста
 
-`~/.config/vk-mattermost/config.json`:
+`~/.config/vk-mattermost/config.json` — **главный фильтр доступа**:
 
 ```json
 {
@@ -44,15 +46,38 @@ make install
 
 Все поля опциональны, кроме хотя бы одного из `vk_token` / `max_token`.
 
-- `vk_token` -- токен сообщества VK ([Настройки -> API -> Ключ доступа](https://dev.vk.com/ru/api/bots/getting-started))
-- `allowed_users` -- VK ID пользователей, которым разрешено писать
-- `max_token` -- токен бота MAX ([Чат-боты -> Интеграция -> Получить токен](https://business.max.ru/self/#/chat-bots))
-- `max_allowed_users` -- MAX user ID, которым разрешено писать в DM (групповые чаты фильтруются через OpenClaw `allowFrom`)
-- `listen` -- адрес привязки (по умолчанию `:8065`)
+- `vk_token` — токен сообщества VK ([Настройки -> API -> Ключ доступа](https://dev.vk.com/ru/api/bots/getting-started))
+- `allowed_users` — VK ID пользователей, которым разрешено писать
+- `max_token` — токен бота MAX ([Чат-боты -> Интеграция -> Получить токен](https://business.max.ru/self/#/chat-bots))
+- `max_allowed_users` — MAX user ID, которым разрешено писать
+- `listen` — адрес привязки (по умолчанию `:8065`)
+
+**Фильтрация в группах:** если пользователь есть в `max_allowed_users`, его сообщения из групповых чатов тоже проходят. Отдельно прописывать группы не нужно.
 
 При первом запуске списки пользователей можно оставить пустыми (`[]`). Используйте команду `/i` для получения ID (см. ниже), затем добавьте их в конфиг и перезапустите мост.
 
 `chmod 600 ~/.config/vk-mattermost/config.json`
+
+## Настройка OpenClaw
+
+OpenClaw получает статическую конфигурацию — фильтрацией он не занимается. Добавить в `openclaw.json`:
+
+```json
+"channels": {
+  "mattermost": {
+    "enabled": true,
+    "baseUrl": "http://localhost:8065",
+    "botToken": "any-token",
+    "allowPrivateNetwork": true,
+    "dmPolicy": "open",
+    "allowFrom": ["*"]
+  }
+}
+```
+
+- `botToken` — токен не нужен, мост работает на localhost без аутентификации, любое непустое значение
+- `dmPolicy: "open"` + `allowFrom: ["*"]` — принимать всё, что пришло через мост
+- `allowPrivateNetwork: true` — обязателен для localhost-моста (иначе SSRF-блокировка)
 
 ## Команда /i
 
@@ -69,7 +94,7 @@ ID пользователя = 87654321
 ID чата = -987654321
 ```
 
-Эти ID нужны для конфигурации моста и OpenClaw.
+Эти ID нужны для конфигурации моста.
 
 ## Настройка VK
 
@@ -87,7 +112,6 @@ ID чата = -987654321
 1. Создать бота: business.max.ru -> Чат-боты -> Интеграция -> Получить токен
 2. Написать боту `/i` в DM, полученный ID добавить в `max_allowed_users`
 3. **Групповые чаты**: добавить бота в группу и **назначить админом** (обязательно для получения сообщений)
-4. Написать `/i` в группу, полученный ID чата добавить как `max-chat-{chat_id}` в `allowFrom` OpenClaw
 
 ## Маппинг ID
 
@@ -96,32 +120,6 @@ ID чата = -987654321
 | VK DM         | `vk-user-{vk_id}`       | `vk-dm-{vk_id}`           |
 | MAX DM        | `max-user-{user_id}`    | `max-dm-{user_id}`        |
 | MAX группа    | `max-chat-{chat_id}`    | `max-chat-{chat_id}`      |
-
-## Настройка OpenClaw
-
-Добавить в `openclaw.json`:
-
-```json
-"channels": {
-  "mattermost": {
-    "enabled": true,
-    "baseUrl": "http://localhost:8065",
-    "botToken": "any-token",
-    "allowPrivateNetwork": true,
-    "dmPolicy": "open",
-    "allowFrom": [
-      "vk-user-12345678",
-      "max-user-87654321",
-      "max-chat--987654321"
-    ]
-  }
-}
-```
-
-- `botToken` -- токен не нужен, мост работает на localhost без аутентификации, любое непустое значение
-- `allowFrom` -- кому OpenClaw отвечает (VK: `vk-user-{id}`, MAX DM: `max-user-{id}`, MAX группа: `max-chat-{chat_id}`)
-- MAX chat_id группы всегда отрицательный: `max-chat--987654321`
-- `allowPrivateNetwork: true` -- обязателен для localhost-моста (иначе SSRF-блокировка)
 
 ## Управление
 
