@@ -147,7 +147,16 @@ func maxPollUpdates(token string, marker *int64) (*maxUpdatesResp, error) {
 }
 
 func maxSendMessage(token string, userID, chatID int64, text string) error {
-	body := fmt.Sprintf(`{"text":%s}`, mustJSON(text))
+	return maxSendMessageFmt(token, userID, chatID, text, "")
+}
+
+func maxSendMessageFmt(token string, userID, chatID int64, text, format string) error {
+	var body string
+	if format != "" {
+		body = fmt.Sprintf(`{"text":%s,"format":%s}`, mustJSON(text), mustJSON(format))
+	} else {
+		body = fmt.Sprintf(`{"text":%s}`, mustJSON(text))
+	}
 	var query string
 	if chatID != 0 {
 		query = fmt.Sprintf("/messages?chat_id=%d", chatID)
@@ -534,10 +543,14 @@ func maxPollLoop(token string, allowedSet map[int64]struct{}) {
 			text := upd.Message.Body.Text
 			chatID := upd.Message.Recipient.ChatID
 
-			// /i -- dump update info to anyone
+			// /i -- show user_id (and chat_id in groups)
 			if strings.TrimSpace(text) == "/i" {
-				info, _ := json.MarshalIndent(upd.Message, "", "  ")
-				reply := fmt.Sprintf("🦞\n```\n%s\n```", string(info))
+				var reply string
+				if chatID < 0 {
+					reply = fmt.Sprintf("ID пользователя = %d\nID чата = %d", senderID, chatID)
+				} else {
+					reply = fmt.Sprintf("ID пользователя = %d", senderID)
+				}
 				log.Printf("[/i] MAX %d chat=%d", senderID, chatID)
 				_ = maxSendMessage(token, senderID, chatID, reply)
 				continue
@@ -552,7 +565,7 @@ func maxPollLoop(token string, allowedSet map[int64]struct{}) {
 				continue
 			}
 
-			if chatID != 0 {
+			if chatID < 0 {
 				log.Printf("<- MAX [%d] chat=%d: %q", senderID, chatID, text)
 				chID := maxMMChatChan(chatID)
 				pushPostedEvent(chID, chID,
@@ -598,15 +611,10 @@ func main() {
 		lp.MessageNew(func(ctx context.Context, obj events.MessageNewObject) {
 			msg := obj.Message
 
-			// /i -- dump message info to anyone
+			// /i -- show user ID to anyone
 			if strings.TrimSpace(msg.Text) == "/i" {
-				info, _ := json.MarshalIndent(map[string]interface{}{
-					"from_id": msg.FromID,
-					"peer_id": msg.PeerID,
-					"date":    msg.Date,
-				}, "", "  ")
-				reply := fmt.Sprintf("🦞\n```\n%s\n```", string(info))
-				log.Printf("[/i] VK %d peer=%d", msg.FromID, msg.PeerID)
+				reply := fmt.Sprintf("ID пользователя = %d", msg.FromID)
+				log.Printf("[/i] VK %d", msg.FromID)
 				_ = sendVKMessage(msg.PeerID, reply)
 				return
 			}
