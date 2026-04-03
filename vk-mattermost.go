@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,10 +21,14 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// --- config ---
+
 type Config struct {
-	VKToken      string `json:"vk_token"`
-	AllowedUsers []int  `json:"allowed_users"`
-	Listen       string `json:"listen"`
+	VKToken         string  `json:"vk_token"`
+	AllowedUsers    []int   `json:"allowed_users"`
+	MaxToken        string  `json:"max_token"`
+	MaxAllowedUsers []int64 `json:"max_allowed_users"`
+	Listen          string  `json:"listen"`
 }
 
 func loadConfig() (*Config, error) {
@@ -39,11 +45,8 @@ func loadConfig() (*Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("config parse error: %w", err)
 	}
-	if cfg.VKToken == "" {
-		return nil, fmt.Errorf("vk_token is required")
-	}
-	if len(cfg.AllowedUsers) == 0 {
-		return nil, fmt.Errorf("allowed_users is required (at least one)")
+	if cfg.VKToken == "" && cfg.MaxToken == "" {
+		return nil, fmt.Errorf("at least one of vk_token or max_token is required")
 	}
 	if cfg.Listen == "" {
 		cfg.Listen = ":8065"
@@ -51,21 +54,151 @@ func loadConfig() (*Config, error) {
 	return &cfg, nil
 }
 
-var (
-	cfg        *Config
-	vkAPI      *api.VK
-	allowedSet map[int]struct{}
-)
+// --- MAX Bot API ---
+
+const maxAPIBase = "https://platform-api.max.ru"
+
+var maxHTTP = &http.Client{Timeout: 90 * time.Second}
+
+type maxUser struct {
+	UserID   int64  `json:"user_id"`
+	Name     string `json:"name"`
+	Username string `json:"username"`
+}
+
+type maxMessageBody struct {
+	Mid  string `json:"mid"`
+	Seq  int64  `json:"seq"`
+	Text string `json:"text"`
+}
+
+type maxRecipient struct {
+	ChatID   int64  `json:"chat_id,omitempty"`
+	ChatType string `json:"chat_type,omitempty"`
+	UserID   int64  `json:"user_id,omitempty"`
+}
+
+type maxMessage struct {
+	Sender    maxUser        `json:"sender"`
+	Recipient maxRecipient   `json:"recipient"`
+	Timestamp int64          `json:"timestamp"`
+	Body      maxMessageBody `json:"body"`
+}
+
+type maxUpdate struct {
+	UpdateType string     `json:"update_type"`
+	Timestamp  int64      `json:"timestamp"`
+	Message    maxMessage `json:"message"`
+}
+
+type maxUpdatesResp struct {
+	Updates []maxUpdate `json:"updates"`
+	Marker  *int64      `json:"marker"`
+}
+
+func maxRequest(token, method, path string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, maxAPIBase+path, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return maxHTTP.Do(req)
+}
+
+func maxGetMe(token string) (*maxUser, error) {
+	resp, err := maxRequest(token, "GET", "/me", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GET /me: %d %s", resp.StatusCode, string(b))
+	}
+	var u maxUser
+	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+func maxPollUpdates(token string, marker *int64) (*maxUpdatesResp, error) {
+	path := "/updates?timeout=30&types=message_created"
+	if marker != nil {
+		path += "&marker=" + strconv.FormatInt(*marker, 10)
+	}
+	resp, err := maxRequest(token, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GET /updates: %d %s", resp.StatusCode, string(b))
+	}
+	var r maxUpdatesResp
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+func maxSendMessage(token string, userID, chatID int64, text string) error {
+	return maxSendMessageFmt(token, userID, chatID, text, "")
+}
+
+func maxSendMessageFmt(token string, userID, chatID int64, text, format string) error {
+	var body string
+	if format != "" {
+		body = fmt.Sprintf(`{"text":%s,"format":%s}`, mustJSON(text), mustJSON(format))
+	} else {
+		body = fmt.Sprintf(`{"text":%s}`, mustJSON(text))
+	}
+	var query string
+	if chatID != 0 {
+		query = fmt.Sprintf("/messages?chat_id=%d", chatID)
+	} else {
+		query = fmt.Sprintf("/messages?user_id=%d", userID)
+	}
+	resp, err := maxRequest(token, "POST", query, strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("POST /messages: %d %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+
+func mustJSON(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// --- constants ---
 
 const (
-	botUserID = "vk-group-bot"
-	teamID    = "vk-team"
-	vkUserPfx = "vk-user-"
-	vkChanPfx = "dm-chan-"
+	botUserID  = "bridge-bot"
+	teamID     = "bridge-team"
+	vkUserPfx  = "vk-user-"
+	vkChanPfx  = "vk-dm-"
+	maxUserPfx = "max-user-"
+	maxDMPfx   = "max-dm-"
+	maxChatPfx = "max-chat-"
 )
 
-func mmUserID(vkID int) string { return fmt.Sprintf("%s%d", vkUserPfx, vkID) }
-func mmChanID(vkID int) string { return fmt.Sprintf("%s%d", vkChanPfx, vkID) }
+func vkMMUserID(vkID int) string        { return fmt.Sprintf("%s%d", vkUserPfx, vkID) }
+func vkMMChanID(vkID int) string        { return fmt.Sprintf("%s%d", vkChanPfx, vkID) }
+func maxMMUserID(maxID int64) string    { return fmt.Sprintf("%s%d", maxUserPfx, maxID) }
+func maxMMDMChan(maxID int64) string    { return fmt.Sprintf("%s%d", maxDMPfx, maxID) }
+func maxMMChatChan(chatID int64) string { return fmt.Sprintf("%s%d", maxChatPfx, chatID) }
+
+// --- WebSocket hub ---
 
 type Hub struct {
 	mu      sync.Mutex
@@ -102,6 +235,10 @@ func (h *Hub) broadcast(msg []byte) {
 	}
 }
 
+// --- VK send ---
+
+var vkAPI *api.VK
+
 func sendVKMessage(peerID int, text string) error {
 	b := params.NewMessagesSendBuilder()
 	b.PeerID(peerID)
@@ -110,6 +247,8 @@ func sendVKMessage(peerID int, text string) error {
 	_, err := vkAPI.MessagesSend(b.Params)
 	return err
 }
+
+// --- Mattermost events ---
 
 var (
 	seqMu sync.Mutex
@@ -133,29 +272,29 @@ type mmPost struct {
 	Type      string `json:"type"`
 }
 
-func pushPostedEvent(fromVKUserID int, text string) {
+func pushPostedEvent(userID, channelID, senderName string, text string) {
 	now := time.Now().UnixMilli()
 	post := mmPost{
-		ID:        fmt.Sprintf("vkpost-%d", now),
+		ID:        fmt.Sprintf("post-%d", now),
 		CreateAt:  now,
 		UpdateAt:  now,
-		UserID:    mmUserID(fromVKUserID),
-		ChannelID: mmChanID(fromVKUserID),
+		UserID:    userID,
+		ChannelID: channelID,
 		Message:   text,
 	}
 	postJSON, _ := json.Marshal(post)
 	event := map[string]interface{}{
 		"event": "posted",
 		"data": map[string]interface{}{
-			"channel_display_name": fmt.Sprintf("VK DM %d", fromVKUserID),
-			"channel_name":         fmt.Sprintf("vk-dm-%d", fromVKUserID),
+			"channel_display_name": channelID,
+			"channel_name":         channelID,
 			"channel_type":         "D",
 			"post":                 string(postJSON),
-			"sender_name":          fmt.Sprintf("vk_%d", fromVKUserID),
+			"sender_name":          senderName,
 			"team_id":              teamID,
 		},
 		"broadcast": map[string]interface{}{
-			"channel_id": mmChanID(fromVKUserID),
+			"channel_id": channelID,
 			"user_id":    "",
 			"team_id":    teamID,
 		},
@@ -164,6 +303,8 @@ func pushPostedEvent(fromVKUserID int, text string) {
 	msg, _ := json.Marshal(event)
 	hub.broadcast(msg)
 }
+
+// --- HTTP handlers ---
 
 func jsonResp(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -174,11 +315,11 @@ func jsonResp(w http.ResponseWriter, code int, v interface{}) {
 func handleUsersMe(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 200, map[string]interface{}{
 		"id":         botUserID,
-		"username":   "vk_bot",
-		"first_name": "VK",
+		"username":   "bridge_bot",
+		"first_name": "Bridge",
 		"last_name":  "Bot",
-		"nickname":   "vk_bot",
-		"email":      "bot@vk.local",
+		"nickname":   "bridge_bot",
+		"email":      "bot@bridge.local",
 		"roles":      "system_user",
 	})
 }
@@ -192,17 +333,17 @@ func handleGetUser(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 200, map[string]interface{}{
 		"id":         userID,
 		"username":   userID,
-		"first_name": "VK",
+		"first_name": "Bridge",
 		"last_name":  "User",
 		"nickname":   userID,
-		"email":      userID + "@vk.local",
+		"email":      userID + "@bridge.local",
 		"roles":      "system_user",
 	})
 }
 
 func handleUserTeams(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 200, []map[string]interface{}{
-		{"id": teamID, "name": "vk-team", "display_name": "VK Team"},
+		{"id": teamID, "name": "bridge-team", "display_name": "Bridge Team"},
 	})
 }
 
@@ -213,18 +354,28 @@ func handleDirectChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	chanID := "dm-unknown"
-	userID := "vk-unknown"
+	userID := "unknown"
 	for _, id := range userIDs {
-		if id != botUserID && strings.HasPrefix(id, vkUserPfx) {
-			userID = id
-			chanID = vkChanPfx + id[len(vkUserPfx):]
-			break
+		if id == botUserID {
+			continue
 		}
+		userID = id
+		// derive channel from user: vk-user-123 -> vk-dm-123, max-user-456 -> max-dm-456
+		if strings.HasPrefix(id, vkUserPfx) {
+			chanID = vkChanPfx + id[len(vkUserPfx):]
+		} else if strings.HasPrefix(id, maxUserPfx) {
+			chanID = maxDMPfx + id[len(maxUserPfx):]
+		} else if strings.HasPrefix(id, maxChatPfx) {
+			chanID = id // max-chat-{chatID} is both user and channel
+		} else {
+			chanID = "dm-" + id
+		}
+		break
 	}
 	jsonResp(w, 200, map[string]interface{}{
 		"id":           chanID,
 		"name":         botUserID + "__" + userID,
-		"display_name": "VK DM",
+		"display_name": "Bridge DM",
 		"type":         "D",
 		"team_id":      "",
 	})
@@ -235,11 +386,13 @@ func handleGetChannel(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 200, map[string]interface{}{
 		"id":           chanID,
 		"name":         chanID,
-		"display_name": "VK DM",
+		"display_name": "Bridge DM",
 		"type":         "D",
 		"team_id":      "",
 	})
 }
+
+var globalCfg *Config
 
 func handleCreatePost(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -250,18 +403,51 @@ func handleCreatePost(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, 400, map[string]string{"message": "bad request"})
 		return
 	}
-	var peerID int
-	fmt.Sscanf(body.ChannelID, vkChanPfx+"%d", &peerID)
-	if peerID == 0 {
-		jsonResp(w, 400, map[string]string{"message": "cannot resolve peer_id from channel_id"})
+
+	var sendErr error
+
+	switch {
+	case strings.HasPrefix(body.ChannelID, vkChanPfx):
+		var peerID int
+		fmt.Sscanf(body.ChannelID, vkChanPfx+"%d", &peerID)
+		if peerID == 0 {
+			jsonResp(w, 400, map[string]string{"message": "cannot resolve vk peer_id"})
+			return
+		}
+		log.Printf("-> VK [%d]: %q", peerID, body.Message)
+		sendErr = sendVKMessage(peerID, body.Message)
+
+	case strings.HasPrefix(body.ChannelID, maxChatPfx):
+		var chatID int64
+		fmt.Sscanf(body.ChannelID, maxChatPfx+"%d", &chatID)
+		if chatID == 0 {
+			jsonResp(w, 400, map[string]string{"message": "cannot resolve max chat_id"})
+			return
+		}
+		log.Printf("-> MAX chat=%d: %q", chatID, body.Message)
+		sendErr = maxSendMessage(globalCfg.MaxToken, 0, chatID, body.Message)
+
+	case strings.HasPrefix(body.ChannelID, maxDMPfx):
+		var userID int64
+		fmt.Sscanf(body.ChannelID, maxDMPfx+"%d", &userID)
+		if userID == 0 {
+			jsonResp(w, 400, map[string]string{"message": "cannot resolve max user_id"})
+			return
+		}
+		log.Printf("-> MAX [%d]: %q", userID, body.Message)
+		sendErr = maxSendMessage(globalCfg.MaxToken, userID, 0, body.Message)
+
+	default:
+		jsonResp(w, 400, map[string]string{"message": "unknown channel prefix: " + body.ChannelID})
 		return
 	}
-	log.Printf("-> VK [%d]: %q", peerID, body.Message)
-	if err := sendVKMessage(peerID, body.Message); err != nil {
-		log.Printf("[ERR] VK send: %v", err)
-		jsonResp(w, 500, map[string]string{"message": err.Error()})
+
+	if sendErr != nil {
+		log.Printf("[ERR] send: %v", sendErr)
+		jsonResp(w, 500, map[string]string{"message": sendErr.Error()})
 		return
 	}
+
 	now := time.Now().UnixMilli()
 	jsonResp(w, 201, mmPost{
 		ID:        fmt.Sprintf("out-%d", now),
@@ -337,47 +523,141 @@ func makeRouter() http.Handler {
 	return mux
 }
 
+// --- MAX long-polling ---
+
+func maxPollLoop(token string, allowedSet map[int64]struct{}) {
+	var marker *int64
+	for {
+		resp, err := maxPollUpdates(token, marker)
+		if err != nil {
+			log.Printf("[ERR] MAX poll: %v", err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		marker = resp.Marker
+		for _, upd := range resp.Updates {
+			if upd.UpdateType != "message_created" {
+				continue
+			}
+			senderID := upd.Message.Sender.UserID
+			text := upd.Message.Body.Text
+			chatID := upd.Message.Recipient.ChatID
+
+			// /i -- show user_id (and chat_id in groups)
+			if strings.TrimSpace(text) == "/i" {
+				var reply string
+				if chatID < 0 {
+					reply = fmt.Sprintf("ID пользователя = %d\nID чата = %d", senderID, chatID)
+				} else {
+					reply = fmt.Sprintf("ID пользователя = %d", senderID)
+				}
+				log.Printf("[/i] MAX %d chat=%d", senderID, chatID)
+				_ = maxSendMessage(token, senderID, chatID, reply)
+				continue
+			}
+
+			if _, ok := allowedSet[senderID]; !ok {
+				log.Printf("[--] MAX ignored from=%d (%s @%s): %q",
+					senderID, upd.Message.Sender.Name, upd.Message.Sender.Username, text)
+				continue
+			}
+			if text == "" {
+				continue
+			}
+
+			if chatID < 0 {
+				log.Printf("<- MAX [%d] chat=%d: %q", senderID, chatID, text)
+				chID := maxMMChatChan(chatID)
+				pushPostedEvent(chID, chID,
+					fmt.Sprintf("max_%d", senderID), text)
+			} else {
+				log.Printf("<- MAX [%d]: %q", senderID, text)
+				pushPostedEvent(maxMMUserID(senderID), maxMMDMChan(senderID),
+					fmt.Sprintf("max_%d", senderID), text)
+			}
+		}
+	}
+}
+
+// --- main ---
+
 func main() {
-	var err error
-	cfg, err = loadConfig()
+	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	globalCfg = cfg
 
-	allowedSet = make(map[int]struct{}, len(cfg.AllowedUsers))
-	for _, id := range cfg.AllowedUsers {
-		allowedSet[id] = struct{}{}
-	}
-
-	vkAPI = api.NewVK(cfg.VKToken)
-
-	lp, err := longpoll.NewLongPollCommunity(vkAPI)
-	if err != nil {
-		log.Fatalf("longpoll init: %v", err)
-	}
-
-	groups, _ := vkAPI.GroupsGetByID(nil)
-	if len(groups.Groups) > 0 {
-		g := groups.Groups[0]
-		log.Printf("[OK] VK group: [%d] %s", g.ID, g.Name)
-	}
-
-	lp.MessageNew(func(ctx context.Context, obj events.MessageNewObject) {
-		msg := obj.Message
-		if _, ok := allowedSet[msg.FromID]; !ok {
-			log.Printf("[--] ignored from=%d", msg.FromID)
-			return
+	// --- VK ---
+	if cfg.VKToken != "" {
+		vkAllowed := make(map[int]struct{}, len(cfg.AllowedUsers))
+		for _, id := range cfg.AllowedUsers {
+			vkAllowed[id] = struct{}{}
 		}
-		log.Printf("<- VK [%d]: %q", msg.FromID, msg.Text)
-		pushPostedEvent(msg.FromID, msg.Text)
-	})
 
-	go func() {
-		log.Println("[OK] VK LongPoll started")
-		if err := lp.Run(); err != nil {
-			log.Fatalf("longpoll: %v", err)
+		vkAPI = api.NewVK(cfg.VKToken)
+
+		lp, err := longpoll.NewLongPollCommunity(vkAPI)
+		if err != nil {
+			log.Fatalf("VK longpoll init: %v", err)
 		}
-	}()
+
+		groups, _ := vkAPI.GroupsGetByID(nil)
+		if len(groups.Groups) > 0 {
+			g := groups.Groups[0]
+			log.Printf("[OK] VK group: [%d] %s", g.ID, g.Name)
+		}
+
+		lp.MessageNew(func(ctx context.Context, obj events.MessageNewObject) {
+			msg := obj.Message
+
+			// /i -- show user ID to anyone
+			if strings.TrimSpace(msg.Text) == "/i" {
+				reply := fmt.Sprintf("ID пользователя = %d", msg.FromID)
+				log.Printf("[/i] VK %d", msg.FromID)
+				_ = sendVKMessage(msg.PeerID, reply)
+				return
+			}
+
+			if _, ok := vkAllowed[msg.FromID]; !ok {
+				log.Printf("[--] VK ignored from=%d", msg.FromID)
+				return
+			}
+			log.Printf("<- VK [%d]: %q", msg.FromID, msg.Text)
+			pushPostedEvent(vkMMUserID(msg.FromID), vkMMChanID(msg.FromID),
+				fmt.Sprintf("vk_%d", msg.FromID), msg.Text)
+		})
+
+		go func() {
+			log.Println("[OK] VK LongPoll started")
+			if err := lp.Run(); err != nil {
+				log.Printf("[ERR] VK longpoll: %v", err)
+			}
+		}()
+	} else {
+		log.Println("[--] VK: disabled (no vk_token)")
+	}
+
+	// --- MAX ---
+	if cfg.MaxToken != "" {
+		maxAllowed := make(map[int64]struct{}, len(cfg.MaxAllowedUsers))
+		for _, id := range cfg.MaxAllowedUsers {
+			maxAllowed[id] = struct{}{}
+		}
+
+		me, err := maxGetMe(cfg.MaxToken)
+		if err != nil {
+			log.Fatalf("MAX GET /me: %v", err)
+		}
+		log.Printf("[OK] MAX bot: [%d] %s (@%s)", me.UserID, me.Name, me.Username)
+
+		go func() {
+			log.Println("[OK] MAX LongPoll started")
+			maxPollLoop(cfg.MaxToken, maxAllowed)
+		}()
+	} else {
+		log.Println("[--] MAX: disabled (no max_token)")
+	}
 
 	log.Printf("[OK] listening on %s", cfg.Listen)
 	if err := http.ListenAndServe(cfg.Listen, makeRouter()); err != nil {
