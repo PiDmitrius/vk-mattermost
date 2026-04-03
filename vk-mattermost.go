@@ -534,14 +534,10 @@ func maxPollLoop(token string, allowedSet map[int64]struct{}) {
 			text := upd.Message.Body.Text
 			chatID := upd.Message.Recipient.ChatID
 
-			// /i -- reply with user/chat IDs to anyone
+			// /i -- dump update info to anyone
 			if strings.TrimSpace(text) == "/i" {
-				var reply string
-				if chatID != 0 {
-					reply = fmt.Sprintf("`%d` @ `%d` 🦞", senderID, chatID)
-				} else {
-					reply = fmt.Sprintf("`%d` 🦞", senderID)
-				}
+				info, _ := json.MarshalIndent(upd.Message, "", "  ")
+				reply := fmt.Sprintf("🦞\n```\n%s\n```", string(info))
 				log.Printf("[/i] MAX %d chat=%d", senderID, chatID)
 				_ = maxSendMessage(token, senderID, chatID, reply)
 				continue
@@ -602,10 +598,15 @@ func main() {
 		lp.MessageNew(func(ctx context.Context, obj events.MessageNewObject) {
 			msg := obj.Message
 
-			// /i -- reply with user ID to anyone
+			// /i -- dump message info to anyone
 			if strings.TrimSpace(msg.Text) == "/i" {
-				reply := fmt.Sprintf("`%d` 🦞", msg.FromID)
-				log.Printf("[/i] VK %d", msg.FromID)
+				info, _ := json.MarshalIndent(map[string]interface{}{
+					"from_id": msg.FromID,
+					"peer_id": msg.PeerID,
+					"date":    msg.Date,
+				}, "", "  ")
+				reply := fmt.Sprintf("🦞\n```\n%s\n```", string(info))
+				log.Printf("[/i] VK %d peer=%d", msg.FromID, msg.PeerID)
 				_ = sendVKMessage(msg.PeerID, reply)
 				return
 			}
