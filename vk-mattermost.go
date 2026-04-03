@@ -534,15 +534,22 @@ func maxPollLoop(token string, allowedSet map[int64]struct{}) {
 			text := upd.Message.Body.Text
 			chatID := upd.Message.Recipient.ChatID
 
+			// /i -- reply with user/chat IDs to anyone
+			if strings.TrimSpace(text) == "/i" {
+				var reply string
+				if chatID != 0 {
+					reply = fmt.Sprintf("`%d` @ `%d` 🦞", senderID, chatID)
+				} else {
+					reply = fmt.Sprintf("`%d` 🦞", senderID)
+				}
+				log.Printf("[/i] MAX %d chat=%d", senderID, chatID)
+				_ = maxSendMessage(token, senderID, chatID, reply)
+				continue
+			}
+
 			if _, ok := allowedSet[senderID]; !ok {
 				log.Printf("[--] MAX ignored from=%d (%s @%s): %q",
 					senderID, upd.Message.Sender.Name, upd.Message.Sender.Username, text)
-				if chatID == 0 {
-					reply := fmt.Sprintf("`%d` 🦞", senderID)
-					if err := maxSendMessage(token, senderID, 0, reply); err != nil {
-						log.Printf("[ERR] MAX reply id: %v", err)
-					}
-				}
 				continue
 			}
 			if text == "" {
@@ -594,10 +601,17 @@ func main() {
 
 		lp.MessageNew(func(ctx context.Context, obj events.MessageNewObject) {
 			msg := obj.Message
+
+			// /i -- reply with user ID to anyone
+			if strings.TrimSpace(msg.Text) == "/i" {
+				reply := fmt.Sprintf("`%d` 🦞", msg.FromID)
+				log.Printf("[/i] VK %d", msg.FromID)
+				_ = sendVKMessage(msg.PeerID, reply)
+				return
+			}
+
 			if _, ok := vkAllowed[msg.FromID]; !ok {
 				log.Printf("[--] VK ignored from=%d", msg.FromID)
-				reply := fmt.Sprintf("`%d` 🦞", msg.FromID)
-				_ = sendVKMessage(msg.FromID, reply)
 				return
 			}
 			log.Printf("<- VK [%d]: %q", msg.FromID, msg.Text)
